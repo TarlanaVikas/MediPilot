@@ -1,0 +1,525 @@
+"""FastAPI application for healthcare appointment scheduling."""
+
+from contextlib import asynccontextmanager
+from typing import Any
+import base64
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import time
+
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from backend.app.database import SessionLocal, init_db
+from backend.app.models import Appointment, Doctor, DoctorAvailability
+from backend.app.graph import build_graph
+from backend.app.doctor_import import (
+    MAX_UPLOAD_BYTES,
+    import_doctors,
+    list_doctors,
+    validate_doctors_json,
+)
+
+
+# ============================================================
+# Admin authentication (stdlib-only signed bearer tokens)
+# ============================================================
+
+ADMIN_TOKEN_TTL_SECONDS = 60 * 60 * 8
+
+
+class AdminLoginRequest(BaseModel):
+    username: str = Field(..., min_length=1, max_length=128)
+    password: str = Field(..., min_length=1, max_length=1024)
+
+
+def _admin_secret() -> str:
+    secret = os.getenv("ADMIN_SECRET_KEY", "")
+    if len(secret) < 32:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin authentication is not configured securely. Set ADMIN_SECRET_KEY to a random value of at least 32 characters.",
+        )
+    return secret
+
+
+def _encode_token(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    encoded = base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    signature = hmac.new(
+        _admin_secret().encode(), encoded.encode(), hashlib.sha256
+    ).digest()
+    signature_encoded = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
+    return f"{encoded}.{signature_encoded}"
+
+
+def _decode_token(token: str) -> dict[str, Any]:
+    try:
+        encoded, signature = token.split(".", 1)
+        expected = hmac.new(
+            _admin_secret().encode(), encoded.encode(), hashlib.sha256
+        ).digest()
+        supplied = base64.urlsafe_b64decode(
+            signature + "=" * (-len(signature) % 4)
+        )
+        if not hmac.compare_digest(expected, supplied):
+            raise ValueError("Invalid signature")
+        raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        payload = json.loads(raw)
+        if payload.get("role") != "admin" or int(payload.get("exp", 0)) < int(time.time()):
+            raise ValueError("Expired token")
+        return payload
+    except Exception as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="Admin session is invalid or expired. Please sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+
+async def require_admin(authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Admin login is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return _decode_token(authorization[7:].strip())
+
+
+# ============================================================
+# Graph
+# ============================================================
+
+graph = build_graph()
+
+
+# ============================================================
+# Application Lifecycle
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize application resources on startup."""
+    init_db()
+    yield
+
+
+# ============================================================
+# FastAPI Application
+# ============================================================
+
+app = FastAPI(
+    title="MediPilot",
+    description=(
+        "MediPilot is a conversational healthcare scheduling application "
+        "built with LangChain, LangGraph, FastAPI and SQLite."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv(
+            "FRONTEND_URL",
+            "http://localhost:5173,http://127.0.0.1:5173",
+        ).split(",")
+        if origin.strip()
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# Request Schemas
+# ============================================================
+
+class SchedulingRequest(BaseModel):
+    """User message sent to the scheduling agent."""
+
+    query: str = Field(
+        ...,
+        min_length=1,
+        description="User's scheduling request.",
+        examples=[
+            "I want an appointment with Dr. Michael Brown"
+        ],
+    )
+
+    thread_id: str = Field(
+        default="default",
+        min_length=1,
+        description="Conversation identifier.",
+        examples=["patient-001"],
+    )
+
+
+# ============================================================
+# Response Schemas
+# ============================================================
+
+class SchedulingResponse(BaseModel):
+    """Response returned by the scheduling agent."""
+
+    thread_id: str
+    response: str
+    status: str
+    trace: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class HealthResponse(BaseModel):
+    status: str
+    service: str
+    version: str
+
+
+class ConversationStateResponse(BaseModel):
+    thread_id: str
+    status: str = ""
+    intent: str = ""
+    patient_name: str = ""
+    doctor_name: str = ""
+    specialty: str = ""
+    appointment_date: str = ""
+    appointment_time: str = ""
+    available_slots: list[str] = Field(default_factory=list)
+
+
+# ============================================================
+# Root and Health Check
+# ============================================================
+
+@app.get("/", response_model=HealthResponse)
+async def root():
+    return {
+        "status": "ok",
+        "service": "MediPilot",
+        "version": "1.0.0",
+    }
+
+
+@app.get("/health", response_model=HealthResponse)
+async def health():
+    return {
+        "status": "healthy",
+        "service": "MediPilot",
+        "version": "1.0.0",
+    }
+
+
+# ============================================================
+# Schedule Appointment
+# ============================================================
+
+@app.post(
+    "/api/v1/schedule",
+    response_model=SchedulingResponse,
+)
+async def schedule(request: SchedulingRequest):
+    try:
+        config = {
+            "configurable": {
+                "thread_id": request.thread_id,
+            }
+        }
+
+        result = graph.invoke(
+            {"query": request.query},
+            config=config,
+        )
+
+        return SchedulingResponse(
+            thread_id=request.thread_id,
+            response=result.get("response", ""),
+            status=result.get("status", ""),
+            trace=result.get("trace", []),
+        )
+
+    except Exception as exc:
+        # Keep internal exception details out of the API response.
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "An error occurred while processing "
+                "the scheduling request."
+            ),
+        ) from exc
+
+
+# ============================================================
+# Conversation State
+# ============================================================
+
+@app.get(
+    "/api/v1/conversations/{thread_id}",
+    response_model=ConversationStateResponse,
+)
+async def get_conversation_state(thread_id: str):
+    try:
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+            }
+        }
+
+        state_snapshot = graph.get_state(config)
+        values = state_snapshot.values
+
+        return ConversationStateResponse(
+            thread_id=thread_id,
+            status=values.get("status", ""),
+            intent=values.get("intent", ""),
+            patient_name=values.get("patient_name", ""),
+            doctor_name=values.get("doctor_name", ""),
+            specialty=values.get("specialty", ""),
+            appointment_date=values.get("appointment_date", ""),
+            appointment_time=values.get("appointment_time", ""),
+            available_slots=values.get("available_slots", []),
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to retrieve conversation state.",
+        ) from exc
+
+
+@app.get("/api/v1/conversations/{thread_id}/debug")
+async def debug_conversation(thread_id: str):
+    try:
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+            }
+        }
+
+        snapshot = graph.get_state(config)
+
+        return {
+            "thread_id": thread_id,
+            "state": snapshot.values,
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to retrieve conversation debug state.",
+        ) from exc
+
+
+# ============================================================
+# Admin Login
+# ============================================================
+
+@app.post("/api/v1/admin/login")
+async def admin_login(request: AdminLoginRequest):
+    username = os.getenv("ADMIN_USERNAME", "")
+    password = os.getenv("ADMIN_PASSWORD", "")
+    if not username or not password:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin credentials are not configured. Set ADMIN_USERNAME and ADMIN_PASSWORD in the backend environment.",
+        )
+    username_ok = secrets.compare_digest(request.username, username)
+    password_ok = secrets.compare_digest(request.password, password)
+    if not (username_ok and password_ok):
+        # Keep the response generic to avoid revealing which field was incorrect.
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    now = int(time.time())
+    token = _encode_token(
+        {"sub": username, "role": "admin", "iat": now,
+         "exp": now + ADMIN_TOKEN_TTL_SECONDS}
+    )
+    return {"access_token": token, "token_type": "bearer",
+            "expires_in": ADMIN_TOKEN_TTL_SECONDS}
+
+
+@app.get("/api/v1/admin/session")
+async def admin_session(admin=Depends(require_admin)):
+    return {"authenticated": True, "username": admin.get("sub", "admin")}
+
+
+# ============================================================
+# Admin: Doctor JSON Validation
+# ============================================================
+
+async def _read_and_validate_doctor_file(
+    file: UploadFile,
+) -> dict[str, Any]:
+    """Read and validate an uploaded doctor JSON file."""
+
+    if (
+        not file.filename
+        or not file.filename.lower().endswith(".json")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a .json file.",
+        )
+
+    try:
+        raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    finally:
+        await file.close()
+
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="The upload exceeds the 2 MB limit.",
+        )
+
+    result = validate_doctors_json(raw)
+
+    if not result["valid"]:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    "The doctor JSON file contains validation errors."
+                ),
+                "errors": result["errors"],
+            },
+        )
+
+    return result
+
+
+# ============================================================
+# Admin: Preview Doctor Import
+# ============================================================
+
+@app.post("/api/v1/admin/doctors/preview")
+async def preview_doctors(file: UploadFile = File(...), admin=Depends(require_admin)):
+    result = await _read_and_validate_doctor_file(file)
+    doctors = result["doctors"]
+
+    specialties = sorted(
+        {doctor["specialty"] for doctor in doctors}
+    )
+
+    return {
+        "valid": True,
+        "total_doctors": len(doctors),
+        "total_specialties": len(specialties),
+        "specialties": specialties,
+        "doctors": doctors[:100],
+        "preview_truncated": len(doctors) > 100,
+        "errors": [],
+    }
+
+
+# ============================================================
+# Admin: Initialize Doctor Directory
+# ============================================================
+
+@app.post("/api/v1/admin/doctors/initialize")
+async def initialize_doctors(file: UploadFile = File(...), admin=Depends(require_admin)):
+    result = await _read_and_validate_doctor_file(file)
+
+    try:
+        import_result = import_doctors(result["doctors"])
+        current_doctors = list_doctors()
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Doctor import failed. "
+                "The database transaction was rolled back."
+            ),
+        ) from exc
+
+    specialties = {
+        doctor["specialty"]
+        for doctor in current_doctors
+        if doctor.get("specialty")
+    }
+
+    return {
+        "message": "Doctor directory initialized successfully.",
+        **import_result,
+        "total_doctors": len(current_doctors),
+        "total_specialties": len(specialties),
+    }
+
+
+# ============================================================
+# Admin: List Doctors
+# ============================================================
+
+@app.get("/api/v1/admin/doctors")
+async def get_doctors(admin=Depends(require_admin)):
+    doctors = list_doctors()
+
+    return {
+        "doctors": doctors,
+        "total_doctors": len(doctors),
+    }
+
+
+# ============================================================
+# Admin: Doctor Summary
+# ============================================================
+
+@app.get("/api/v1/admin/doctors/summary")
+async def get_doctor_summary(admin=Depends(require_admin)):
+    doctors = list_doctors()
+
+    specialties = {
+        doctor["specialty"]
+        for doctor in doctors
+        if doctor.get("specialty")
+    }
+
+    return {
+        "total_doctors": len(doctors),
+        "total_specialties": len(specialties),
+    }
+
+# ============================================================
+# Admin: Reset Doctor Directory
+# ============================================================
+
+@app.post("/api/v1/admin/doctors/reset")
+async def reset_doctor_directory(admin=Depends(require_admin)):
+    """Delete all doctors, their availability, and linked appointments.
+
+    This destructive operation is restricted to authenticated admins.
+    Patient records are retained.
+    """
+    db = SessionLocal()
+    try:
+        appointments_deleted = db.query(Appointment).delete(
+            synchronize_session=False
+        )
+        availability_deleted = db.query(DoctorAvailability).delete(
+            synchronize_session=False
+        )
+        doctors_deleted = db.query(Doctor).delete(
+            synchronize_session=False
+        )
+        db.commit()
+        return {
+            "message": "Doctor directory reset successfully.",
+            "doctors_deleted": doctors_deleted,
+            "availability_slots_deleted": availability_deleted,
+            "appointments_deleted": appointments_deleted,
+        }
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Could not reset the doctor directory. No changes were committed.",
+        ) from exc
+    finally:
+        db.close()
